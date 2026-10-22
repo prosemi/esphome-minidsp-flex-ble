@@ -1,0 +1,549 @@
+# ESPHome: miniDSP Flex control over Bluetooth LE
+#
+# Turns an ESP32 into a Bluetooth LE bridge between Home Assistant and a
+# miniDSP Flex. Exposes volume, mute, input, preset and Dirac Live as Home
+# Assistant entities, plus an action for relative volume changes (rotary
+# remotes, buttons, automations).
+#
+# Compatibility
+#   Uses the same Bluetooth LE control channel as the miniDSP KD-1 knob, so it
+#   targets the Bluetooth-equipped Flex models the KD-1 supports over BLE:
+#     - Flex (2x4), Flex DL          <- tested
+#     - Flex Eight, Flex Eight DL    <- expected to work, not tested yet
+#   The unit must show "BLE" under the device name in miniDSP Device Console
+#   (older firmware may need an update). Flex HT / HTx have no BLE and are not
+#   supported. SHD and Tide16 are controlled over Wi-Fi, not BLE - not supported.
+#   Notes: the input list below matches the Flex 2x4; Dirac Live entities only
+#   make sense on DL models. Only one BLE client can be connected at a time, so
+#   a KD-1 or a phone app connected over BLE will block this bridge.
+#
+# Hardware: tested on M5Stack AtomS3 Lite (ESP32-S3) with ESPHome 2026.1.
+# Any ESP32 with Bluetooth LE should work - adjust the esp32: section.
+#
+# Not affiliated with or endorsed by miniDSP. Use at your own risk: a wrong
+# volume command can be loud. Keep max_db conservative and test with the
+# amplifier off or the Flex muted first.
+#
+# ---------------------------------------------------------------------------
+# Protocol (observed on the Flex's GATT service, e.g. with nRF Connect)
+#   GATT service 1F00, characteristic 2F00 (write + notify)
+#   Command:  ASCII "CMD <hex>\r\n"     Reply: ASCII hex in a notification
+#
+#   Read volume + mute   0505FFDA02  ->  0605FFDA <volume> <mute>
+#   Read input           0505FFD901  ->  0505FFD9 <input 0-4>
+#   Read preset          0505FFD801  ->  0505FFD8 <preset 0-3>
+#   Read Dirac Live      0505FFE001  ->  0505FFE0 <0 = on, 1 = off>
+#
+#   Set volume 0342<v>, mute 0317<0/1>, input 0334<0-4>,
+#   preset 0425<0-3>01, Dirac Live 033F<0/1>
+#   Command acknowledgement: 02AB
+#
+#   Volume: v = -2 x dB (higher value = quieter, 255 = -127.5 dB)
+#   Inputs: 0 Analog, 1 Toslink, 2 SPDIF, 3 USB, 4 Bluetooth
+#
+# Behaviour
+#   - Keeps a permanent BLE connection to the Flex and reconnects on its own.
+#   - One command at a time; the next one is sent after the Flex confirms
+#     (acknowledgement or state notification).
+#   - Relative changes (flex_volume_delta) are accumulated into one target, so
+#     fast turns of a remote are never lost or replayed.
+#   - Never louder than max_db, at most +2 dB per step and at most 4 dB above
+#     the last confirmed volume.
+#   - All states come from the Flex itself - nothing is assumed or restored.
+# ---------------------------------------------------------------------------
+
+substitutions:
+  name: minidsp-flex-ble
+  friendly_name: miniDSP Flex BLE
+  max_db: "-15.0"          # loudest volume allowed from Home Assistant (dB)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO              # DEBUG shows every command (TX) and reply (RX)
+  logs:
+    esp32_ble_tracker: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  actions:
+    # Relative volume change, e.g. from a rotary remote.
+    # delta_db: positive = louder, negative = quieter, at most ±2 dB per call.
+    - action: flex_volume_delta
+      variables:
+        delta_db: float
+      then:
+        - lambda: |-
+            if (!id(flex_connected) || id(flex_vol) < 0) {
+              ESP_LOGW("flex", "Volume change ignored: Flex not connected");
+              return;
+            }
+            if (!std::isfinite(delta_db) || delta_db == 0.0f || std::fabs(delta_db) > 2.0f) {
+              ESP_LOGW("flex", "Volume change ignored: invalid delta %.2f dB", delta_db);
+              return;
+            }
+            const int min_raw = (int) lroundf(-2.0f * ${max_db});
+            const int steps = (int) lroundf(delta_db * 2.0f);
+            const int base = id(flex_target) >= 0 ? id(flex_target) : id(flex_vol);
+            int target = std::clamp(base - steps, min_raw, 255);
+            // Target at most 4 dB louder than the volume the Flex has confirmed.
+            target = std::max(target, id(flex_vol) - 8);
+            id(flex_target) = target;
+            id(flex_target_ms) = millis();
+            ESP_LOGD("flex", "Delta %+.1f dB -> target %.1f dB", delta_db, -0.5f * target);
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+esp32_ble_tracker:
+
+ble_client:
+  - id: flex_ble
+    mac_address: !secret minidsp_flex_mac   # Bluetooth MAC of the Flex
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            const uint32_t now = millis();
+            id(flex_connected) = true;
+            id(flex_connected_ms) = now;
+            id(flex_last_rx_ms) = now;
+            id(flex_vol) = id(flex_mute) = id(flex_input) = id(flex_preset) = id(flex_dirac) = -1;
+            id(flex_target) = -1;
+            id(flex_vol_wait) = false;
+            id(flex_reads) = 0x0F;   // read everything
+            ESP_LOGI("flex", "Connected to Flex");
+            id(flex_status).publish_state("Connected, reading state");
+        - script.execute: flex_publish
+    on_disconnect:
+      then:
+        - script.stop: flex_tx
+        - lambda: |-
+            id(flex_connected) = false;
+            id(flex_vol) = id(flex_mute) = id(flex_input) = id(flex_preset) = id(flex_dirac) = -1;
+            id(flex_target) = -1;
+            id(flex_vol_wait) = false;
+            id(flex_reads) = 0;
+            ESP_LOGW("flex", "Disconnected from Flex");
+            id(flex_status).publish_state("Disconnected, waiting for Flex");
+        - script.execute: flex_publish
+
+globals:
+  - id: flex_connected
+    type: bool
+    initial_value: 'false'
+  - id: flex_connected_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: flex_last_rx_ms
+    type: uint32_t
+    initial_value: '0'
+  # State confirmed by the Flex (-1 = unknown).
+  - id: flex_vol
+    type: int
+    initial_value: '-1'
+  - id: flex_mute
+    type: int
+    initial_value: '-1'
+  - id: flex_input
+    type: int
+    initial_value: '-1'
+  - id: flex_preset
+    type: int
+    initial_value: '-1'
+  - id: flex_dirac
+    type: int
+    initial_value: '-1'
+  # Volume target (protocol value, -1 = none) and when it was set.
+  - id: flex_target
+    type: int
+    initial_value: '-1'
+  - id: flex_target_ms
+    type: uint32_t
+    initial_value: '0'
+  # Waiting for confirmation of the last volume write.
+  - id: flex_vol_wait
+    type: bool
+    initial_value: 'false'
+  - id: flex_vol_queried
+    type: bool
+    initial_value: 'false'
+  - id: flex_vol_sent_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: flex_vol_sent
+    type: int
+    initial_value: '-1'
+  # Pending reads: 1 = volume/mute, 2 = input, 4 = preset, 8 = Dirac Live.
+  - id: flex_reads
+    type: int
+    initial_value: '0'
+
+number:
+  - platform: template
+    id: flex_volume_control
+    name: "Flex volume control"
+    unit_of_measurement: dB
+    icon: mdi:volume-high
+    min_value: -127.5
+    max_value: ${max_db}
+    step: 0.5
+    mode: box
+    optimistic: false
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (!id(flex_connected) || id(flex_vol) < 0) {
+            id(flex_status).publish_state("Volume rejected: not connected");
+            id(flex_publish).execute();
+            return;
+          }
+          const int min_raw = (int) lroundf(-2.0f * ${max_db});
+          id(flex_target) = std::clamp((int) lroundf(-2.0f * x), min_raw, 255);
+          id(flex_target_ms) = millis();
+
+switch:
+  - platform: template
+    id: flex_mute_control
+    name: "Flex mute control"
+    icon: mdi:volume-off
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          if (!id(flex_connected) || id(flex_vol) < 0) {
+            id(flex_status).publish_state("Mute rejected: not connected");
+            id(flex_publish).execute();
+            return;
+          }
+          id(flex_tx).execute(std::string("CMD 031701\r\n"));
+          id(flex_reads) |= 1;
+    turn_off_action:
+      - lambda: |-
+          if (!id(flex_connected) || id(flex_vol) < 0) {
+            id(flex_status).publish_state("Unmute rejected: not connected");
+            id(flex_publish).execute();
+            return;
+          }
+          // Do not unmute if the volume was set above max_db elsewhere (e.g. the original remote).
+          const int min_raw = (int) lroundf(-2.0f * ${max_db});
+          if (id(flex_vol) < min_raw) {
+            id(flex_status).publish_state("Unmute rejected: volume above limit");
+            id(flex_publish).execute();
+            return;
+          }
+          id(flex_tx).execute(std::string("CMD 031700\r\n"));
+          id(flex_reads) |= 1;
+  - platform: template
+    id: flex_dirac_control
+    name: "Flex Dirac control"
+    icon: mdi:waveform
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          if (!id(flex_connected)) { id(flex_publish).execute(); return; }
+          id(flex_tx).execute(std::string("CMD 033F00\r\n"));
+          id(flex_reads) |= 8;
+    turn_off_action:
+      - lambda: |-
+          if (!id(flex_connected)) { id(flex_publish).execute(); return; }
+          id(flex_tx).execute(std::string("CMD 033F01\r\n"));
+          id(flex_reads) |= 8;
+
+select:
+  - platform: template
+    id: flex_input_control
+    name: "Flex input control"
+    icon: mdi:audio-input-stereo-minijack
+    options: ["Analog", "Toslink", "SPDIF", "USB", "Bluetooth"]
+    optimistic: false
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (!id(flex_connected)) { id(flex_publish).execute(); return; }
+          const char *labels[] = {"Analog", "Toslink", "SPDIF", "USB", "Bluetooth"};
+          for (int i = 0; i < 5; ++i) {
+            if (x == labels[i]) {
+              char cmd[24];
+              snprintf(cmd, sizeof(cmd), "CMD 0334%02x\r\n", i);
+              id(flex_tx).execute(std::string(cmd));
+              id(flex_reads) |= 2;
+            }
+          }
+  - platform: template
+    id: flex_preset_control
+    name: "Flex preset control"
+    icon: mdi:playlist-play
+    options: ["1", "2", "3", "4"]
+    optimistic: false
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (!id(flex_connected)) { id(flex_publish).execute(); return; }
+          for (int i = 0; i < 4; ++i) {
+            if (x == std::to_string(i + 1)) {
+              char cmd[24];
+              snprintf(cmd, sizeof(cmd), "CMD 0425%02x01\r\n", i);
+              id(flex_tx).execute(std::string(cmd));
+              id(flex_reads) |= 0x0F;   // a preset can change volume and Dirac Live
+            }
+          }
+
+button:
+  - platform: template
+    name: "Flex refresh status"
+    icon: mdi:refresh
+    on_press:
+      - lambda: |-
+          if (id(flex_connected)) id(flex_reads) |= 0x0F;
+
+sensor:
+  - platform: template
+    id: flex_volume_db
+    name: "Flex volume"
+    unit_of_measurement: dB
+    accuracy_decimals: 1
+    icon: mdi:volume-high
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: flex_ble_link
+    name: "Flex BLE connected"
+    device_class: connectivity
+  - platform: template
+    id: flex_ready
+    name: "Flex control ready"
+    device_class: connectivity
+  - platform: template
+    id: flex_muted
+    name: "Flex muted"
+  - platform: template
+    id: flex_dirac_enabled
+    name: "Flex Dirac Live"
+
+text_sensor:
+  - platform: template
+    id: flex_status
+    name: "Flex control result"
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: flex_input_name
+    name: "Flex input"
+    update_interval: never
+  # Notifications from the Flex.
+  - platform: ble_client
+    id: flex_rx
+    ble_client_id: flex_ble
+    service_uuid: "1F00"
+    characteristic_uuid: "2F00"
+    notify: true
+    update_interval: never
+    internal: true
+    on_notify:
+      then:
+        - lambda: |-
+            std::string f = x;
+            while (!f.empty() && isspace((unsigned char) f.back())) f.pop_back();
+            size_t start = 0;
+            while (start < f.size() && isspace((unsigned char) f[start])) ++start;
+            f.erase(0, start);
+            for (auto &c : f) c = toupper((unsigned char) c);
+            ESP_LOGD("flex", "RX %s", f.c_str());
+
+            // 02AB = command acknowledgement: the next volume step can go out right away.
+            if (f == "02AB") {
+              if (id(flex_vol_wait)) {
+                id(flex_vol) = id(flex_vol_sent);
+                id(flex_vol_wait) = false;
+                if (id(flex_target) == id(flex_vol)) id(flex_target) = -1;
+                id(flex_last_rx_ms) = millis();
+                id(flex_publish).execute();
+              }
+              return;
+            }
+
+            auto hex = [](char c) -> int {
+              if (c >= '0' && c <= '9') return c - '0';
+              if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+              return -1;
+            };
+            auto byte_at = [&](size_t i) -> int {
+              const int a = hex(f[i]), b = hex(f[i + 1]);
+              return (a < 0 || b < 0) ? -1 : a * 16 + b;
+            };
+
+            if (f.size() != 10 && f.size() != 12) {
+              ESP_LOGD("flex", "Ignoring frame of unexpected length");
+              return;
+            }
+            const int v = byte_at(8);
+            if (v < 0) return;
+
+            if (f.size() == 12 && f.compare(0, 8, "0605FFDA") == 0) {
+              const int m = byte_at(10);
+              if (m < 0 || m > 1) return;
+              id(flex_vol) = v;
+              id(flex_mute) = m;
+              id(flex_vol_wait) = false;
+              if (id(flex_target) == v) id(flex_target) = -1;
+            } else if (f.size() == 10 && f.compare(0, 8, "0505FFD9") == 0 && v <= 4) {
+              id(flex_input) = v;
+            } else if (f.size() == 10 && f.compare(0, 8, "0505FFD8") == 0 && v <= 3) {
+              // Another preset may have its own volume, input and Dirac Live state.
+              if (id(flex_preset) >= 0 && id(flex_preset) != v) id(flex_reads) |= 0x0B;
+              id(flex_preset) = v;
+            } else if (f.size() == 10 && f.compare(0, 8, "0505FFE0") == 0 && v <= 1) {
+              id(flex_dirac) = v;
+            } else {
+              ESP_LOGD("flex", "Ignoring unknown frame");
+              return;
+            }
+            id(flex_last_rx_ms) = millis();
+            id(flex_publish).execute();
+
+script:
+  # Sends one command; further commands wait in the queue. 80 ms gap between commands.
+  - id: flex_tx
+    mode: queued
+    max_runs: 10
+    parameters:
+      command: string
+    then:
+      - lambda: |-
+          ESP_LOGD("flex", "TX %s", command.substr(0, command.size() - 2).c_str());
+      - ble_client.ble_write:
+          id: flex_ble
+          service_uuid: "1F00"
+          characteristic_uuid: "2F00"
+          value: !lambda return std::vector<uint8_t>(command.begin(), command.end());
+      - delay: 80ms
+
+  # Publishes the state to Home Assistant.
+  - id: flex_publish
+    mode: single
+    then:
+      - lambda: |-
+          const bool link = id(flex_connected);
+          const bool ready = link && id(flex_vol) >= 0;
+          id(flex_ble_link).publish_state(link);
+          id(flex_ready).publish_state(ready);
+          const float db = ready ? -0.5f * id(flex_vol) : NAN;
+          id(flex_volume_db).publish_state(db);
+          id(flex_volume_control).publish_state(db);
+          if (ready) {
+            id(flex_muted).publish_state(id(flex_mute) == 1);
+            id(flex_mute_control).publish_state(id(flex_mute) == 1);
+            if (id(flex_status).state == "Connected, reading state") id(flex_status).publish_state("Ready");
+          }
+          if (link && id(flex_dirac) >= 0) {
+            id(flex_dirac_enabled).publish_state(id(flex_dirac) == 0);
+            id(flex_dirac_control).publish_state(id(flex_dirac) == 0);
+          }
+          const char *labels[] = {"Analog", "Toslink", "SPDIF", "USB", "Bluetooth"};
+          if (link && id(flex_input) >= 0) {
+            id(flex_input_name).publish_state(labels[id(flex_input)]);
+            id(flex_input_control).publish_state(labels[id(flex_input)]);
+          } else {
+            id(flex_input_name).publish_state("Unknown");
+          }
+          if (link && id(flex_preset) >= 0)
+            id(flex_preset_control).publish_state(std::to_string(id(flex_preset) + 1));
+
+interval:
+  # Command scheduler: volume confirmation, volume changes, state reads.
+  - interval: 50ms
+    then:
+      - lambda: |-
+          if (!id(flex_connected)) return;
+          const uint32_t now = millis();
+          if (now - id(flex_connected_ms) < 800) return;   // give the Flex a moment after connecting
+
+          // No reply from the Flex for 3 minutes: drop the link, it reconnects on its own.
+          if (now - id(flex_last_rx_ms) > 180000) {
+            ESP_LOGW("flex", "No reply from Flex for 3 min, reconnecting");
+            id(flex_last_rx_ms) = now;
+            id(flex_ble)->disconnect();
+            return;
+          }
+          if (id(flex_tx).is_running()) return;
+
+          auto send = [](const char *body) {
+            id(flex_tx).execute(std::string("CMD ") + body + "\r\n");
+          };
+
+          // 1. Waiting for confirmation of the last volume write.
+          if (id(flex_vol_wait)) {
+            if (now - id(flex_vol_sent_ms) > 2000) {
+              ESP_LOGW("flex", "No volume confirmation from Flex");
+              id(flex_vol_wait) = false;
+              id(flex_target) = -1;
+              id(flex_status).publish_state("No volume confirmation");
+            } else if (!id(flex_vol_queried) && now - id(flex_vol_sent_ms) > 300) {
+              id(flex_vol_queried) = true;   // no state from the Flex yet - ask once
+              send("0505FFDA02");
+            }
+            return;
+          }
+
+          // 2. Volume change.
+          if (id(flex_target) >= 0 && id(flex_vol) >= 0) {
+            if (now - id(flex_target_ms) > 5000) {
+              ESP_LOGW("flex", "Dropping volume target (not confirmed within 5 s)");
+              id(flex_target) = -1;
+            } else if (id(flex_target) == id(flex_vol)) {
+              id(flex_target) = -1;
+            } else {
+              const int next = std::max(id(flex_target), id(flex_vol) - 4);   // at most +2 dB
+              char body[12];
+              snprintf(body, sizeof(body), "0342%02x", next);
+              id(flex_vol_wait) = true;
+              id(flex_vol_queried) = false;
+              id(flex_vol_sent_ms) = now;
+              id(flex_vol_sent) = next;
+              send(body);
+              return;
+            }
+          }
+
+          // 3. State reads.
+          if (id(flex_reads) & 1) { id(flex_reads) &= ~1; send("0505FFDA02"); return; }
+          if (id(flex_reads) & 2) { id(flex_reads) &= ~2; send("0505FFD901"); return; }
+          if (id(flex_reads) & 4) { id(flex_reads) &= ~4; send("0505FFD801"); return; }
+          if (id(flex_reads) & 8) { id(flex_reads) &= ~8; send("0505FFE001"); return; }
+
+  # Once a minute: check that the Flex still answers.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(flex_connected) && id(flex_vol) >= 0) id(flex_reads) |= 1;
+
+  # Keep the BLE client enabled so it reconnects whenever the Flex is in range.
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (!id(flex_connected) && !id(flex_ble)->enabled) {
+            ESP_LOGW("flex", "BLE client was disabled, enabling");
+            id(flex_ble)->set_enabled(true);
+          }

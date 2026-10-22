@@ -1,0 +1,37 @@
+# Home Assistant automation: Flex volume from a Philips Hue Tap Dial (Zigbee2MQTT).
+#
+# Paste into Settings > Automations > Create automation > Edit in YAML.
+# Adjust:
+#   - the MQTT topic of your dial (zigbee2mqtt/<friendly name>)
+#   - the entity / action names if you changed `name` in the ESPHome YAML
+#     (default prefix: minidsp_flex_ble)
+#
+# Each rotation event is turned into one relative change of 0.5–2 dB,
+# depending on how fast the dial is turned. The ESP accumulates quick turns,
+# so `mode: queued` is safe and nothing is replayed.
+
+alias: Flex volume – Hue Tap Dial
+description: Rotate the Hue Tap Dial to change the miniDSP Flex volume.
+mode: queued
+max: 20
+triggers:
+  - trigger: mqtt
+    topic: zigbee2mqtt/hue_tap_dial
+conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.payload_json is defined
+         and (trigger.payload_json.action | default('')).startswith('dial_rotate_') }}
+  - condition: state
+    entity_id: binary_sensor.minidsp_flex_ble_flex_control_ready
+    state: "on"
+actions:
+  - variables:
+      steps: "{{ trigger.payload_json.action_step_size | default(0) | int(0) }}"
+      size: "{{ [2.0, (steps / 16) | round(0, 'ceil') * 0.5] | min }}"
+      direction: "{{ 1 if 'right' in trigger.payload_json.action else -1 }}"
+  - condition: template
+    value_template: "{{ size | float(0) > 0 }}"
+  - action: esphome.minidsp_flex_ble_flex_volume_delta
+    data:
+      delta_db: "{{ direction * size | float(0) }}"

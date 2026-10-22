@@ -1,0 +1,24 @@
+# Home Assistant automation: Flex volume up/down from any two buttons.
+#
+# Replace the two triggers with your own (button entities, remotes, Zigbee
+# events...). Each press changes the volume by 1 dB.
+
+alias: Flex volume – buttons
+description: Volume up/down on the miniDSP Flex.
+mode: queued
+max: 20
+triggers:
+  - trigger: state
+    entity_id: input_button.flex_volume_up      # replace
+    id: up
+  - trigger: state
+    entity_id: input_button.flex_volume_down    # replace
+    id: down
+conditions:
+  - condition: state
+    entity_id: binary_sensor.minidsp_flex_ble_flex_control_ready
+    state: "on"
+actions:
+  - action: esphome.minidsp_flex_ble_flex_volume_delta
+    data:
+      delta_db: "{{ 1 if trigger.id == 'up' else -1 }}"

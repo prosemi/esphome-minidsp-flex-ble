@@ -3,7 +3,8 @@
 # Turns an ESP32 into a Bluetooth LE bridge between Home Assistant and a
 # miniDSP Flex. Exposes volume, mute, input, preset and Dirac Live as Home
 # Assistant entities, plus an action for relative volume changes (rotary
-# remotes, buttons, automations).
+# remotes, buttons, automations). Power on/off is sent over IR, because the
+# BLE channel has no power command.
 #
 # Compatibility
 #   Uses the same Bluetooth LE control channel as the miniDSP KD-1 knob, so it
@@ -19,7 +20,7 @@
 #
 # Hardware: tested on M5Stack AtomS3 Lite (ESP32-S3) with ESPHome 2026.1.
 # Any ESP32 with Bluetooth LE should work - adjust the esp32: section.
-# Optional IR power button uses the AtomS3 Lite's built-in IR LED (GPIO4).
+# Power on/off uses the AtomS3 Lite's built-in IR LED (GPIO4).
 #
 # Not affiliated with or endorsed by miniDSP. Use at your own risk: a wrong
 # volume command can be loud. Keep max_db conservative and test with the
@@ -310,11 +311,11 @@ select:
             }
           }
 
-# Optional: power on/off over IR. The AtomS3 Lite has a built-in IR LED on GPIO4
-# (transmit only). Its range is short, so the Atom must sit close to the Flex and
-# point at its IR window. For more range use an M5Stack Unit IR on the Grove port
-# and change the pin. Remove this block and the "Flex power (IR)" button if your
-# board has no IR LED.
+# Power on/off over IR (the BLE channel has no power command). The AtomS3 Lite
+# has a built-in IR LED on GPIO4 (transmit only). Its range is short, so the Atom
+# must sit close to the Flex and point at its IR window. For more range use an
+# M5Stack Unit IR on the Grove port and change the pin. On other boards set the pin
+# of your IR LED or module.
 remote_transmitter:
   id: ir_tx
   pin: GPIO4

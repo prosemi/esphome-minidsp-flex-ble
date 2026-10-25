@@ -1,11 +1,13 @@
 # esphome-minidsp-flex-ble
 
-ESPHome Bluetooth LE bridge for miniDSP Flex: control volume, mute, input, preset and
-Dirac Live from Home Assistant.
+ESPHome Bluetooth LE bridge for miniDSP Flex: power on/off, volume, mute, input,
+preset and Dirac Live from Home Assistant.
 
 An ESP32 keeps a permanent Bluetooth LE connection to the Flex and exposes it to
 Home Assistant as normal entities. Use them from dashboards, automations, voice
 assistants or physical remotes (e.g. a Zigbee rotary dial) – no cloud, no phone app.
+Power on/off goes over IR from the same board, since the Bluetooth LE channel has no
+power command.
 
 ## KD-1 alternative – with Home Assistant
 
@@ -21,7 +23,8 @@ offers:
 **What you need**
 
 - miniDSP Flex with Bluetooth LE (see [Compatibility](#compatibility))
-- an ESP32 board with Bluetooth LE (e.g. M5Stack AtomS3 Lite)
+- an ESP32 board with Bluetooth LE and an IR transmitter (e.g. M5Stack AtomS3 Lite,
+  which has both built in)
 - Home Assistant with ESPHome
 - optional: a physical remote such as the Philips Hue Tap Dial
 
@@ -39,6 +42,7 @@ one Bluetooth LE client.
 
 ## Features
 
+- **Power on/off** over IR, with the power code of the original Flex remote
 - Volume (absolute, 0.5 dB steps) and **relative volume action** for remotes and buttons
 - Mute, Dirac Live on/off, input selection, presets 1–4
 - All states are read from the Flex – changes made with the IR remote or Device
@@ -48,8 +52,6 @@ one Bluetooth LE client.
 - One command at a time, the next one only after the Flex confirms – fast turns of a
   dial are merged, never lost or replayed
 - Reconnects on its own after a power cut or when the Flex comes back in range
-- Optional: **power on/off over IR** with the AtomS3 Lite's built-in IR LED
-  (see [Power on/off over IR](#power-onoff-over-ir-optional))
 
 ## Compatibility
 
@@ -70,8 +72,9 @@ uses, so it targets the Bluetooth-equipped Flex models the KD-1 supports over BL
   Bluetooth will keep the bridge from connecting.
 
 **ESP32 board:** tested on an M5Stack AtomS3 Lite (ESP32-S3) with ESPHome 2026.1. Any
-ESP32 with Bluetooth LE should work – adjust the `esp32:` section. Place it within
-good Bluetooth range of the Flex.
+ESP32 with Bluetooth LE should work – adjust the `esp32:` section and set the IR pin
+(see [Power on/off](#power-onoff)). Place it within good Bluetooth range of the Flex
+and close enough for IR.
 
 ## Installation
 
@@ -82,9 +85,11 @@ good Bluetooth range of the Flex.
    [`minidsp-flex-ble.yaml`](minidsp-flex-ble.yaml).
 3. Add the entries from [`secrets.yaml.example`](secrets.yaml.example) to your ESPHome
    `secrets.yaml` (Wi-Fi, API key, OTA password, Flex MAC).
-4. If you don't use an AtomS3 Lite, change the `esp32:` section for your board.
-5. **Install** (first time over USB, later wirelessly).
-6. Home Assistant discovers the device – accept it under *Settings → Devices &
+4. If you don't use an AtomS3 Lite, change the `esp32:` section and the
+   `remote_transmitter:` pin for your board.
+5. Place the board close to the Flex with its IR LED facing the Flex's IR window.
+6. **Install** (first time over USB, later wirelessly).
+7. Home Assistant discovers the device – accept it under *Settings → Devices &
    services*. The entities appear immediately.
 
 Optional settings in `substitutions:` at the top of the YAML:
@@ -111,7 +116,7 @@ With the default `name` (`minidsp-flex-ble`):
 | `sensor.minidsp_flex_ble_flex_input` | Current input |
 | `select.minidsp_flex_ble_flex_preset_control` | Preset 1–4 |
 | `button.minidsp_flex_ble_flex_refresh_status` | Re-read all states from the Flex |
-| `button.minidsp_flex_ble_flex_power_ir` | Power on/off over IR (optional, see below) |
+| `button.minidsp_flex_ble_flex_power_ir` | Power on/off (IR toggle, see [Power on/off](#power-onoff)) |
 | `binary_sensor.minidsp_flex_ble_flex_ble_connected` | BLE link to the Flex |
 | `binary_sensor.minidsp_flex_ble_flex_control_ready` | Connected and volume known – use it as a condition |
 | `sensor.minidsp_flex_ble_flex_control_result` | Last status / error message (diagnostic) |
@@ -134,12 +139,13 @@ produces events. Examples:
 - [`examples/automation-volume-buttons.yaml`](examples/automation-volume-buttons.yaml) –
   any two buttons, 1 dB per press
 
-## Power on/off over IR (optional)
+## Power on/off
 
-The Bluetooth LE channel has no power command, but the M5Stack AtomS3 Lite has a
-built-in IR transmitter (GPIO4). The YAML uses it for a **Flex power (IR)** button that
-sends the power code of the original miniDSP Flex remote (NEC, address `0xCA35`,
-command `0xBF40`). BLE and IR work at the same time on the same board.
+The Bluetooth LE channel has no power command, so the bridge switches the Flex on and
+off over IR. The M5Stack AtomS3 Lite has a built-in IR transmitter (GPIO4). The
+**Flex power (IR)** button sends the power code of the original miniDSP Flex remote
+(NEC, address `0xCA35`, command `0xBF40`). BLE and IR work at the same time on the
+same board.
 
 - It is a **toggle**, just like the power key on the remote: each press switches the
   Flex on or off. There is no separate "on" and "off" code.
@@ -149,8 +155,8 @@ command `0xBF40`). BLE and IR work at the same time on the same board.
 - For more range, add an **M5Stack Unit IR** (IR emitter and receiver) to the Grove
   port of the Atom. It reaches up to about 5 m. Change `pin:` in the
   `remote_transmitter:` section to the Grove pin wired to the unit's transmitter.
-- Using another ESP32 board without an IR LED? Remove the `remote_transmitter:` block
-  and the *Flex power (IR)* button from the YAML.
+- Another ESP32 board: connect an IR LED (with a transistor) or an IR module and set
+  `pin:` in `remote_transmitter:` to its GPIO.
 
 ## Protocol
 

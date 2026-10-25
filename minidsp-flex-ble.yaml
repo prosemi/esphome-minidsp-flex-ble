@@ -19,6 +19,7 @@
 #
 # Hardware: tested on M5Stack AtomS3 Lite (ESP32-S3) with ESPHome 2026.1.
 # Any ESP32 with Bluetooth LE should work - adjust the esp32: section.
+# Optional IR power button uses the AtomS3 Lite's built-in IR LED (GPIO4).
 #
 # Not affiliated with or endorsed by miniDSP. Use at your own risk: a wrong
 # volume command can be loud. Keep max_db conservative and test with the
@@ -309,7 +310,26 @@ select:
             }
           }
 
+# Optional: power on/off over IR. The AtomS3 Lite has a built-in IR LED on GPIO4
+# (transmit only). Its range is short, so the Atom must sit close to the Flex and
+# point at its IR window. For more range use an M5Stack Unit IR on the Grove port
+# and change the pin. Remove this block and the "Flex power (IR)" button if your
+# board has no IR LED.
+remote_transmitter:
+  id: ir_tx
+  pin: GPIO4
+  carrier_duty_percent: 50%
+
 button:
+  # Power toggle code of the miniDSP Flex IR remote (NEC). Same as one press of
+  # the power key - it switches the Flex on or off, there is no separate on/off.
+  - platform: template
+    name: "Flex power (IR)"
+    icon: mdi:power
+    on_press:
+      - remote_transmitter.transmit_nec:
+          address: 0xCA35
+          command: 0xBF40
   - platform: template
     name: "Flex refresh status"
     icon: mdi:refresh

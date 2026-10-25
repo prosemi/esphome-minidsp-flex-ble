@@ -48,6 +48,8 @@ one Bluetooth LE client.
 - One command at a time, the next one only after the Flex confirms – fast turns of a
   dial are merged, never lost or replayed
 - Reconnects on its own after a power cut or when the Flex comes back in range
+- Optional: **power on/off over IR** with the AtomS3 Lite's built-in IR LED
+  (see [Power on/off over IR](#power-onoff-over-ir-optional))
 
 ## Compatibility
 
@@ -109,6 +111,7 @@ With the default `name` (`minidsp-flex-ble`):
 | `sensor.minidsp_flex_ble_flex_input` | Current input |
 | `select.minidsp_flex_ble_flex_preset_control` | Preset 1–4 |
 | `button.minidsp_flex_ble_flex_refresh_status` | Re-read all states from the Flex |
+| `button.minidsp_flex_ble_flex_power_ir` | Power on/off over IR (optional, see below) |
 | `binary_sensor.minidsp_flex_ble_flex_ble_connected` | BLE link to the Flex |
 | `binary_sensor.minidsp_flex_ble_flex_control_ready` | Connected and volume known – use it as a condition |
 | `sensor.minidsp_flex_ble_flex_control_result` | Last status / error message (diagnostic) |
@@ -130,6 +133,24 @@ produces events. Examples:
   Philips Hue Tap Dial via Zigbee2MQTT, 0.5–2 dB per event depending on rotation speed
 - [`examples/automation-volume-buttons.yaml`](examples/automation-volume-buttons.yaml) –
   any two buttons, 1 dB per press
+
+## Power on/off over IR (optional)
+
+The Bluetooth LE channel has no power command, but the M5Stack AtomS3 Lite has a
+built-in IR transmitter (GPIO4). The YAML uses it for a **Flex power (IR)** button that
+sends the power code of the original miniDSP Flex remote (NEC, address `0xCA35`,
+command `0xBF40`). BLE and IR work at the same time on the same board.
+
+- It is a **toggle**, just like the power key on the remote: each press switches the
+  Flex on or off. There is no separate "on" and "off" code.
+- **The range of the built-in LED is short.** The Atom must sit very close to the Flex
+  and point at its IR window. You can't see the IR light, but a phone camera (usually
+  the front one) shows a short flash when you press the button.
+- For more range, add an **M5Stack Unit IR** (IR emitter and receiver) to the Grove
+  port of the Atom. It reaches up to about 5 m. Change `pin:` in the
+  `remote_transmitter:` section to the Grove pin wired to the unit's transmitter.
+- Using another ESP32 board without an IR LED? Remove the `remote_transmitter:` block
+  and the *Flex power (IR)* button from the YAML.
 
 ## Protocol
 

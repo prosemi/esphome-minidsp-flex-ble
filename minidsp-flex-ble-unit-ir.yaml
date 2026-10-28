@@ -1,0 +1,20 @@
+# ESPHome: miniDSP Flex control over Bluetooth LE - variant with M5Stack Unit IR
+#
+# Same as minidsp-flex-ble.yaml, but power on/off is sent through an M5Stack
+# Unit IR (IR emitter + receiver) plugged into the Grove port of an AtomS3 Lite,
+# instead of the Atom's built-in IR LED. Use it when the Atom can't sit in front
+# of the Flex: the Unit IR is on a cable and can be placed at the Flex's IR window.
+#
+# Grove port of the AtomS3 Lite: yellow wire = G2 = Unit IR transmitter,
+# white wire = G1 = Unit IR receiver (not used here).
+#
+# Put both files in your ESPHome config folder and install this one. Everything
+# else (entities, settings, secrets) is identical to minidsp-flex-ble.yaml.
+# Settings from minidsp-flex-ble.yaml can be overridden in substitutions below.
+
+substitutions:
+  ir_tx_pin: GPIO2         # Unit IR transmitter (yellow wire of the Grove cable)
+  ir_tx_duty: 50%          # IR power; lower it if the Flex misses codes at very short distance
+
+packages:
+  base: !include minidsp-flex-ble.yaml

@@ -20,7 +20,8 @@
 #
 # Hardware: tested on M5Stack AtomS3 Lite (ESP32-S3) with ESPHome 2026.1.
 # Any ESP32 with Bluetooth LE should work - adjust the esp32: section.
-# Power on/off uses the AtomS3 Lite's built-in IR LED (GPIO4).
+# Power on/off uses the AtomS3 Lite's built-in IR LED (GPIO4). For an M5Stack
+# Unit IR on the Grove port use minidsp-flex-ble-unit-ir.yaml instead.
 #
 # Not affiliated with or endorsed by miniDSP. Use at your own risk: a wrong
 # volume command can be loud. Keep max_db conservative and test with the
@@ -58,6 +59,15 @@ substitutions:
   name: minidsp-flex-ble
   friendly_name: miniDSP Flex BLE
   max_db: "-15.0"          # loudest volume allowed from Home Assistant (dB)
+  # IR transmitter for power on/off: GPIO4 = AtomS3 Lite built-in LED,
+  # GPIO2 = M5Stack Unit IR on the AtomS3 Lite Grove port (yellow wire).
+  ir_tx_pin: GPIO4
+  ir_tx_duty: 50%          # IR power: 50% = strongest, lower = weaker (very short distances)
+  # Power code of the miniDSP Flex IR remote (NEC).
+  flex_ir_address: "0xCA35"
+  flex_ir_command: "0xBF40"
+  # How long to wait for the BLE connection after an IR wake-up (usually 10-20 s).
+  ir_wake_timeout: 40s
 
 esphome:
   name: ${name}
@@ -269,6 +279,19 @@ switch:
           if (!id(flex_connected)) { id(flex_publish).execute(); return; }
           id(flex_tx).execute(std::string("CMD 033F01\r\n"));
           id(flex_reads) |= 8;
+  # Power on/off over IR with a state check. State = BLE link to the Flex, which
+  # comes up 10-20 s after the Flex wakes. Turning on sends IR only while the Flex
+  # is off and retries (max 3), turning off sends IR only while it is on - so a
+  # second press never switches the Flex back by accident.
+  - platform: template
+    id: flex_power
+    name: "Flex power"
+    icon: mdi:power
+    lambda: return id(flex_connected);
+    turn_on_action:
+      - script.execute: flex_power_on
+    turn_off_action:
+      - script.execute: flex_standby
 
 select:
   - platform: template
@@ -311,26 +334,24 @@ select:
             }
           }
 
-# Power on/off over IR (the BLE channel has no power command). The AtomS3 Lite
-# has a built-in IR LED on GPIO4 (transmit only). Its range is short, so the Atom
-# must sit close to the Flex and point at its IR window. For more range use an
-# M5Stack Unit IR on the Grove port and change the pin. On other boards set the pin
+# Power on/off over IR (the BLE channel has no power command). Pin and power are
+# set in substitutions: ir_tx_pin (GPIO4 = AtomS3 Lite built-in LED) and
+# ir_tx_duty. Point the LED at the Flex's IR window. On other boards set the pin
 # of your IR LED or module.
 remote_transmitter:
   id: ir_tx
-  pin: GPIO4
-  carrier_duty_percent: 50%
+  pin: ${ir_tx_pin}
+  carrier_duty_percent: ${ir_tx_duty}
+  non_blocking: true
 
 button:
-  # Power toggle code of the miniDSP Flex IR remote (NEC). Same as one press of
-  # the power key - it switches the Flex on or off, there is no separate on/off.
+  # One press of the power key on the Flex remote - toggles on/standby without
+  # checking the state. For everyday use prefer the "Flex power" switch.
   - platform: template
     name: "Flex power (IR)"
     icon: mdi:power
     on_press:
-      - remote_transmitter.transmit_nec:
-          address: 0xCA35
-          command: 0xBF40
+      - script.execute: flex_ir_power
   - platform: template
     name: "Flex refresh status"
     icon: mdi:refresh
@@ -491,6 +512,63 @@ script:
           }
           if (link && id(flex_preset) >= 0)
             id(flex_preset_control).publish_state(std::to_string(id(flex_preset) + 1));
+
+  # One IR press of the power key.
+  - id: flex_ir_power
+    mode: single
+    then:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: ir_tx
+          address: ${flex_ir_address}
+          command: ${flex_ir_command}
+
+  # Power on: IR only while the Flex is off, the BLE connection confirms it.
+  # At most 3 attempts. Never a second press while the Flex is already on
+  # (that would put it back into standby).
+  - id: flex_power_on
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return id(flex_connected);
+          then:
+            - logger.log: "Flex already on - IR not sent"
+          else:
+            - repeat:
+                count: 3
+                then:
+                  - if:
+                      condition:
+                        lambda: return !id(flex_connected);
+                      then:
+                        - logger.log: "Sending IR power to wake the Flex"
+                        - script.execute: flex_ir_power
+                        - wait_until:
+                            condition:
+                              lambda: return id(flex_connected);
+                            timeout: ${ir_wake_timeout}
+            - if:
+                condition:
+                  lambda: return !id(flex_connected);
+                then:
+                  - logger.log:
+                      level: WARN
+                      format: "Flex did not wake up after 3 IR attempts"
+                  - lambda: id(flex_status).publish_state("Flex did not wake up after 3 IR attempts");
+
+  # Standby: IR only while the Flex is on.
+  - id: flex_standby
+    mode: single
+    then:
+      - script.stop: flex_power_on
+      - if:
+          condition:
+            lambda: return id(flex_connected);
+          then:
+            - logger.log: "Sending IR power to put the Flex in standby"
+            - script.execute: flex_ir_power
+          else:
+            - logger.log: "Flex already in standby - IR not sent"
 
 interval:
   # Command scheduler: volume confirmation, volume changes, state reads.
